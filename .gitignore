@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+*.db
+dtf_league.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/IDE
+.idea/
+.DS_Store
