@@ -3,7 +3,7 @@
 A Telegram bot running a monthly $DTF Stakeholder Points contest for
 [dtf.finance](https://dtf.finance) (Robinhood Chain) — points for knowledge,
 analysis, predictions, content, and community help, plus independently
-scheduled weekly challenges with their own instant $DTF reward.
+scheduled weekly challenges with their own $DTF reward.
 
 ## Setup
 
@@ -104,13 +104,22 @@ the database on startup, not held only in memory).
 Members see everything open/upcoming with `/listchallenges` and enter
 with `/submit <challenge_id> <entry>` (requires registration).
 
+Review what's been submitted before judging (DM only):
+```
+/submissions <challenge_id>
+```
+Lists every entry for that challenge — who submitted it, when, and the
+full content — newest first, so you can actually read through them
+before deciding a winner instead of relying on catching entries live in
+the group.
+
 Pick a winner:
 ```
 /announcewinner <challenge_id> <@username>
 ```
 This awards Gold-tier weekly-win points, closes the challenge, posts the
-public shoutout, and — if you've set a weekly reward amount — queues an
-instant weekly $DTF payout for that winner.
+public shoutout, and — if you've set a weekly reward amount — queues a
+pending weekly $DTF payout for that winner.
 
 ## Payouts
 
@@ -120,7 +129,13 @@ Two separate reward cadences, both configurable:
 ```
 /setweeklyreward <amount>
 ```
-This pays out automatically the moment you `/announcewinner`.
+`/announcewinner` creates a **pending** payout row for that winner — it
+doesn't send anything on its own. Run:
+```
+/finalizepayout weekly challenge-<id>
+```
+to actually produce the wallet/amount line for that win. Nothing is
+paid "automatically" — this is the step that finalizes it.
 
 **Monthly** — the bulk pool, split only among your **top N** scorers on
 the cumulative monthly leaderboard (default top 10 — every category and

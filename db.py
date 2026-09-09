@@ -166,6 +166,17 @@ def register_wallet(telegram_id: int, wallet_address: str, twitter_handle: str =
         )
 
 
+def find_user_by_wallet(wallet_address: str):
+    """Case-insensitive lookup — used to catch the same wallet being
+    registered under multiple Telegram accounts before it flows into a
+    finalized payout list."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE LOWER(wallet_address) = LOWER(?) AND wallet_address != ''",
+            (wallet_address,),
+        ).fetchone()
+
+
 def find_user_by_username(username: str):
     with get_conn() as conn:
         return conn.execute(
@@ -288,6 +299,29 @@ def reset_month(period_label: str):
         return rows
 
 
+def get_archived_period(period_label: str):
+    """Reads back what /resetmonth wrote — otherwise monthly_archive is
+    write-only and past months' final standings are unrecoverable."""
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT telegram_id, username, points
+            FROM monthly_archive
+            WHERE period_label = ?
+            ORDER BY points DESC
+            """,
+            (period_label,),
+        ).fetchall()
+
+
+def list_archived_periods():
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT DISTINCT period_label, MIN(archived_at) as archived_at "
+            "FROM monthly_archive GROUP BY period_label ORDER BY archived_at DESC"
+        ).fetchall()
+
+
 # --- challenges (independent, scheduled) --------------------------------
 
 def create_challenge(title: str, description: str, chat_id: int,
@@ -348,6 +382,40 @@ def add_submission(challenge_id: int, telegram_id: int, content: str) -> int:
             (challenge_id, telegram_id, content, int(time.time())),
         )
         return cur.lastrowid
+
+
+def add_or_update_submission(challenge_id: int, telegram_id: int, content: str) -> tuple[int, bool]:
+    """Upsert instead of always inserting — otherwise members can spam
+    /submit on the same challenge repeatedly, inflating entry counts
+    shown in the status digest. Returns (submission_id, was_update)."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM submissions WHERE challenge_id = ? AND telegram_id = ?",
+            (challenge_id, telegram_id),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE submissions SET content = ?, created_at = ?, status = 'pending' WHERE id = ?",
+                (content, int(time.time()), existing["id"]),
+            )
+            return existing["id"], True
+        cur = conn.execute(
+            """
+            INSERT INTO submissions (challenge_id, telegram_id, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (challenge_id, telegram_id, content, int(time.time())),
+        )
+        return cur.lastrowid, False
+
+
+def has_submission(challenge_id: int, telegram_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM submissions WHERE challenge_id = ? AND telegram_id = ? LIMIT 1",
+            (challenge_id, telegram_id),
+        ).fetchone()
+        return row is not None
 
 
 def get_submissions_for_challenge(challenge_id: int, oldest_first: bool = False):

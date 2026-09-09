@@ -36,8 +36,10 @@ CATEGORIES = {
 
 TIERS = ("bronze", "silver", "gold")
 
-# Anti-farming: max points a single user can earn per category per day
-# (set to None to disable a cap for that category)
+# Anti-farming: max points a single user can earn per category within
+# any rolling 24-hour window (NOT a calendar-day reset — someone capped
+# at 11pm is capped until 11pm the next day, not until midnight).
+# Set to None to disable a cap for that category.
 DAILY_CATEGORY_CAP = {
     "discussion": 20,
     "helping": 20,

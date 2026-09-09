@@ -19,6 +19,7 @@ Design notes:
 
 import logging
 import re
+import re
 import time
 from datetime import datetime, timezone
 
@@ -158,6 +159,24 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     wallet = context.args[0]
     twitter = " ".join(context.args[1:])
+
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
+        await update.message.reply_text(
+            "That doesn't look like a valid wallet address — expected an EVM "
+            "address in the form 0x followed by 40 hex characters. Double-check "
+            "and try again."
+        )
+        return
+
+    existing_owner = db.find_user_by_wallet(wallet)
+    if existing_owner and existing_owner["telegram_id"] != update.effective_user.id:
+        await update.message.reply_text(
+            "That wallet is already registered to a different account. If this is "
+            "a mistake, contact an admin — duplicate wallets aren't allowed since "
+            "they'd conflict in the payout list."
+        )
+        return
+
     db.register_wallet(update.effective_user.id, wallet, twitter)
     await update.message.reply_text(
         f"✅ Registered!\nWallet: `{esc(wallet)}`\nTwitter: {esc(twitter)}\n\n"
@@ -355,8 +374,11 @@ async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That challenge isn't open right now — see /listchallenges.")
         return
     content = " ".join(context.args[1:])
-    db.add_submission(challenge_id, update.effective_user.id, content)
-    await update.message.reply_text("Submission received — a mod will review it. ✅")
+    _, was_update = db.add_or_update_submission(challenge_id, update.effective_user.id, content)
+    if was_update:
+        await update.message.reply_text("Your submission for this challenge was updated. ✅")
+    else:
+        await update.message.reply_text("Submission received — a mod will review it. ✅")
 
 
 async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,8 +595,16 @@ async def announcewinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Challenge ID must be a number.")
         return
     challenge = db.get_challenge(challenge_id)
-    if not challenge or challenge["status"] == "closed" and challenge["winner_id"]:
-        await update.message.reply_text("That challenge doesn't exist or already has a winner.")
+    if not challenge:
+        await update.message.reply_text("That challenge doesn't exist.")
+        return
+    if challenge["status"] == "scheduled":
+        await update.message.reply_text(
+            "That challenge hasn't opened yet — wait until it's live before announcing a winner."
+        )
+        return
+    if challenge["winner_id"]:
+        await update.message.reply_text("That challenge already has a winner.")
         return
 
     username = context.args[1].lstrip("@")
@@ -584,6 +614,16 @@ async def announcewinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Can't find @{username} — they need to have messaged the bot at least once (e.g. /start)."
         )
         return
+    if not db.has_submission(challenge_id, winner["telegram_id"]):
+        force = len(context.args) > 2 and context.args[2].lower() == "force"
+        if not force:
+            await update.message.reply_text(
+                f"@{username} doesn't have a submission on record for challenge #{challenge_id}. "
+                f"Check /submissions {challenge_id} to confirm before announcing — this is a "
+                "safety check to catch typos in the wrong username.\n\n"
+                f"If this is correct anyway, run: /announcewinner {challenge_id} @{username} force"
+            )
+            return
 
     emoji, label, tiers = CATEGORIES["weekly_win"]
     points = tiers["gold"]
@@ -650,7 +690,7 @@ async def award(update: Update, context: ContextTypes.DEFAULT_TYPE):
         already = db.get_points_today_for_category(target["telegram_id"], category)
         if already + points > cap:
             await update.message.reply_text(
-                f"Daily cap reached for {label} ({already}/{cap} pts today). Award skipped."
+                f"24-hour cap reached for {label} ({already}/{cap} pts in the last 24h). Award skipped."
             )
             return
 
@@ -691,6 +731,36 @@ async def resetmonth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Monthly points archived for {len(rows)} members under '{label}' and reset to 0."
     )
+
+
+async def pastmonths(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reads back what /resetmonth archived — without this, monthly_archive
+    is write-only and past standings are unrecoverable without opening the
+    database file directly."""
+    if not await require_admin_dm(update):
+        return
+    if not context.args:
+        periods = db.list_archived_periods()
+        if not periods:
+            await update.message.reply_text("No archived months yet — /resetmonth hasn't been run.")
+            return
+        lines = ["*Archived periods* (use /pastmonths <label> for the standings):\n"]
+        for p in periods:
+            lines.append(f"— {esc(p['period_label'])}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    period_label = " ".join(context.args)
+    rows = db.get_archived_period(period_label)
+    if not rows:
+        await update.message.reply_text(f"No archive found for '{period_label}'. See /pastmonths for the list.")
+        return
+
+    lines = [f"*Final standings — {esc(period_label)}*\n"]
+    for i, r in enumerate(rows, start=1):
+        who = f"@{esc(r['username'])}" if r["username"] else str(r["telegram_id"])
+        lines.append(f"{i}. {who} — {r['points']} pts")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # --- payout admin commands -------------------------------------------------
@@ -792,11 +862,29 @@ async def generatepayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.clear_pending_payouts("monthly", period_label)
         lines = [f"*Auto payout — {esc(period_label)}* ({pool} $DTF pool, top {top_n})\n"]
-        for u in top:
-            share = u["monthly_points"] / total_points * pool
-            db.upsert_payout(u["telegram_id"], u["wallet_address"], round(share, 4), "monthly", period_label)
+
+        # Largest-remainder method: rounding each share independently can
+        # drift the total a few fractions of $DTF away from the actual
+        # pool amount. Working in integer 0.0001-$DTF units and handing
+        # out the leftover units to whoever has the biggest rounding
+        # remainder keeps the total exact.
+        UNIT = 10000  # 4 decimal places
+        pool_units = round(pool * UNIT)
+        raw_shares = [(u, u["monthly_points"] / total_points * pool_units) for u in top]
+        floor_shares = [(u, int(share)) for u, share in raw_shares]
+        remainders = sorted(
+            range(len(raw_shares)), key=lambda i: raw_shares[i][1] - floor_shares[i][1], reverse=True
+        )
+        leftover = pool_units - sum(s for _, s in floor_shares)
+        final_units = [s for _, s in floor_shares]
+        for i in remainders[:leftover]:
+            final_units[i] += 1
+
+        for (u, _), units in zip(raw_shares, final_units):
+            amount = units / UNIT
+            db.upsert_payout(u["telegram_id"], u["wallet_address"], amount, "monthly", period_label)
             who = format_user(u["username"], u["display_name"])
-            lines.append(f"{who} — {u['monthly_points']} pts → {round(share, 4)} $DTF")
+            lines.append(f"{who} — {u['monthly_points']} pts → {amount} $DTF")
         lines.append("\nReview above, then /finalizepayout monthly " + period_label)
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     else:
@@ -918,6 +1006,7 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("payoutlist", "View payout entries"),
     BotCommand("finalizepayout", "Lock in payout list"),
     BotCommand("resetmonth", "Archive and reset monthly points"),
+    BotCommand("pastmonths", "View archived monthly standings"),
 ]
 
 
@@ -1003,6 +1092,7 @@ def main():
     app.add_handler(CommandHandler("payoutlist", payoutlist))
     app.add_handler(CommandHandler("finalizepayout", finalizepayout))
     app.add_handler(CommandHandler("resetmonth", resetmonth))
+    app.add_handler(CommandHandler("pastmonths", pastmonths))
 
     logger.info("DTF Stakeholders League bot starting...")
     app.run_polling()
