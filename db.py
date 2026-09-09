@@ -350,6 +350,43 @@ def add_submission(challenge_id: int, telegram_id: int, content: str) -> int:
         return cur.lastrowid
 
 
+def get_submissions_for_challenge(challenge_id: int, oldest_first: bool = False):
+    """All submissions for a challenge, joined with the submitter's
+    username/display name so admins can review without a separate lookup.
+    Newest-first by default; pass oldest_first=True to review in the
+    order entries actually came in (e.g. judging "first N correct")."""
+    order = "ASC" if oldest_first else "DESC"
+    with get_conn() as conn:
+        return conn.execute(
+            f"""
+            SELECT s.id, s.telegram_id, s.content, s.status, s.created_at,
+                   u.username, u.display_name
+            FROM submissions s
+            LEFT JOIN users u ON u.telegram_id = s.telegram_id
+            WHERE s.challenge_id = ?
+            ORDER BY s.created_at {order}
+            """,
+            (challenge_id,),
+        ).fetchall()
+
+
+def get_submission(submission_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM submissions WHERE id = ?", (submission_id,)
+        ).fetchone()
+
+
+def set_submission_status(submission_id: int, status: str) -> bool:
+    """Returns True if a row was actually updated."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE submissions SET status = ? WHERE id = ?",
+            (status, submission_id),
+        )
+        return cur.rowcount > 0
+
+
 # --- payouts --------------------------------------------------------------
 
 def upsert_payout(telegram_id: int, wallet_address: str, amount_dtf: float,

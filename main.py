@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.helpers import escape_markdown
 
 import db
 from config import (
@@ -73,8 +74,18 @@ def touch_user(update: Update):
     db.upsert_user(u.id, u.username or "", u.full_name or "")
 
 
+def esc(text) -> str:
+    """Escape any user-controlled text before it goes into a message sent
+    with parse_mode="Markdown" — a stray *, _, or ` in a display name,
+    challenge title, or note would otherwise make Telegram reject the
+    whole message with no visible error."""
+    return escape_markdown(str(text), version=1)
+
+
 def format_user(username: str, display_name: str) -> str:
-    return f"@{username}" if username else (display_name or "Unknown")
+    if username:
+        return f"@{esc(username)}"
+    return esc(display_name) if display_name else "Unknown"
 
 
 def parse_delay_seconds(text: str) -> int:
@@ -124,7 +135,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "All other points — across every category and challenge — build "
         "one cumulative monthly total. At month end, the top scorers on "
         "that leaderboard share the monthly $DTF reward pool. You must be "
-        "registered (`/register <wallet>` in DM) to receive payouts.\n\n"
+        "registered (`/register <wallet> <twitter>` in DM) to receive payouts.\n\n"
         "Commands: /leaderboard /mypoints /mystats /listchallenges /submit /register",
         parse_mode="Markdown",
     )
@@ -149,7 +160,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     twitter = " ".join(context.args[1:])
     db.register_wallet(update.effective_user.id, wallet, twitter)
     await update.message.reply_text(
-        f"✅ Registered!\nWallet: `{wallet}`\nTwitter: {twitter}\n\n"
+        f"✅ Registered!\nWallet: `{esc(wallet)}`\nTwitter: {esc(twitter)}\n\n"
         "You're now eligible for $DTF reward payouts based on your points.",
         parse_mode="Markdown",
     )
@@ -184,7 +195,7 @@ async def mypoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("You haven't earned any points yet.")
         return
-    reg = "✅ Registered" if u["registered"] else "⚠️ Not registered — use /register in DM to be payout-eligible"
+    reg = "✅ Registered" if u["registered"] else "⚠️ Not registered — DM `/register <wallet> <twitter>` to be payout-eligible"
     await update.message.reply_text(
         f"🏆 Total: *{u['total_points']}* pts\n"
         f"📅 This month: *{u['monthly_points']}* pts\n"
@@ -224,7 +235,7 @@ def _build_status_digest() -> str:
             hrs = remaining // 3600
             entries = db.get_submission_count(c["id"])
             lines.append(
-                f"#{c['id']} — {c['title']}\n"
+                f"#{c['id']} — {esc(c['title'])}\n"
                 f"  Deadline: ~{hrs}h left · {entries} entries so far\n"
                 f"  Enter: `/submit {c['id']} <entry>`"
             )
@@ -235,7 +246,7 @@ def _build_status_digest() -> str:
         lines.append("\n*🕒 Coming up*")
         for c in scheduled:
             start_str = datetime.fromtimestamp(c["start_time"], tz=timezone.utc).strftime("%b %d, %H:%M UTC")
-            lines.append(f"#{c['id']} — {c['title']} (opens {start_str})")
+            lines.append(f"#{c['id']} — {esc(c['title'])} (opens {start_str})")
 
     lines.append(f"\n👥 Registered participants: {db.get_registered_count()}")
     lines.append("📜 Full rules: /rules")
@@ -311,12 +322,12 @@ async def listchallenges(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for c in open_ones:
             remaining = max(0, c["end_time"] - now)
             hrs = remaining // 3600
-            lines.append(f"#{c['id']} — {c['title']} (closes in ~{hrs}h)\n_{c['description']}_")
+            lines.append(f"#{c['id']} — {esc(c['title'])} (closes in ~{hrs}h)\n_{esc(c['description'])}_")
     if scheduled:
         lines.append("\n*🕒 Scheduled*")
         for c in scheduled:
             start_str = datetime.fromtimestamp(c["start_time"], tz=timezone.utc).strftime("%b %d, %H:%M UTC")
-            lines.append(f"#{c['id']} — {c['title']} (opens {start_str})")
+            lines.append(f"#{c['id']} — {esc(c['title'])} (opens {start_str})")
 
     lines.append("\nUse `/submit <id> <entry>` on a live challenge.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -327,7 +338,7 @@ async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = db.get_user(update.effective_user.id)
     if not u or not u["registered"]:
         await update.message.reply_text(
-            "You need to register first — DM me `/register <wallet address>` "
+            "You need to register first — DM me `/register <wallet address> <twitter handle>` "
             "so you're eligible if you win."
         )
         return
@@ -348,6 +359,82 @@ async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Submission received — a mod will review it. ✅")
 
 
+async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only, DM-only: list every submission for a challenge so you
+    can actually review entries before awarding points."""
+    if not await require_admin_dm(update):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Usage: /submissions <challenge_id> [oldest]\n"
+            "Add \"oldest\" to review earliest-first — useful for judging "
+            "\"first N correct\" style challenges."
+        )
+        return
+    try:
+        challenge_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Challenge ID must be a number — see /listchallenges.")
+        return
+
+    oldest_first = len(context.args) > 1 and context.args[1].lower() == "oldest"
+
+    challenge = db.get_challenge(challenge_id)
+    if not challenge:
+        await update.message.reply_text(f"No challenge #{challenge_id} found.")
+        return
+
+    entries = db.get_submissions_for_challenge(challenge_id, oldest_first=oldest_first)
+    if not entries:
+        await update.message.reply_text(
+            f"No submissions yet for Challenge #{challenge_id} — {esc(challenge['title'])}."
+        )
+        return
+
+    order_note = " (oldest first)" if oldest_first else ""
+    header = f"*Submissions for #{challenge_id} — {esc(challenge['title'])}*{order_note} ({len(entries)} total)\n"
+    blocks = [header]
+    for e in entries:
+        who = format_user(e["username"], e["display_name"] or str(e["telegram_id"]))
+        when = datetime.fromtimestamp(e["created_at"], tz=timezone.utc).strftime("%b %d, %H:%M UTC")
+        status_flag = {"approved": " ✅", "rejected": " ❌"}.get(e["status"], "")
+        blocks.append(
+            f"— {who} [id {e['id']}]{status_flag} ({when}):\n{esc(e['content'])}"
+        )
+
+    # Telegram messages cap at 4096 chars — chunk if there are a lot of entries.
+    message = "\n\n".join(blocks)
+    for i in range(0, len(message), 3800):
+        await update.message.reply_text(message[i:i + 3800], parse_mode="Markdown")
+
+
+async def _set_submission_status(update: Update, context: ContextTypes.DEFAULT_TYPE, status: str, label: str):
+    if not await require_admin_dm(update):
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text(f"Usage: /{label} <submission_id> — get IDs from /submissions <challenge_id>")
+        return
+    try:
+        submission_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Submission ID must be a number.")
+        return
+    sub = db.get_submission(submission_id)
+    if not sub:
+        await update.message.reply_text(f"No submission #{submission_id} found.")
+        return
+    db.set_submission_status(submission_id, status)
+    await update.message.reply_text(f"Submission #{submission_id} marked {status}. ✅")
+
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_submission_status(update, context, "approved", "approve")
+
+
+async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _set_submission_status(update, context, "rejected", "reject")
+
+
 # --- scheduling internals ------------------------------------------------
 
 async def _open_challenge_job(context: ContextTypes.DEFAULT_TYPE):
@@ -361,7 +448,7 @@ async def _open_challenge_job(context: ContextTypes.DEFAULT_TYPE):
             chat_id=challenge["chat_id"],
             text=(
                 f"🏆 *Challenge #{challenge_id} is now live!*\n\n"
-                f"*{challenge['title']}*\n{challenge['description']}\n\n"
+                f"*{esc(challenge['title'])}*\n{esc(challenge['description'])}\n\n"
                 f"Enter with `/submit {challenge_id} <your entry>`"
             ),
             parse_mode="Markdown",
@@ -378,7 +465,7 @@ async def _close_challenge_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=challenge["chat_id"],
             text=(
-                f"⏱️ Submissions for *Challenge #{challenge_id} — {challenge['title']}* "
+                f"⏱️ Submissions for *Challenge #{challenge_id} — {esc(challenge['title'])}* "
                 "are now closed. Winner announcement coming soon!"
             ),
             parse_mode="Markdown",
@@ -460,7 +547,7 @@ async def newchallenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=group_chat_id,
             text=(
                 f"🏆 *Challenge #{challenge_id} is now live!*\n\n"
-                f"*{title}*\n{description}\n\n"
+                f"*{esc(title)}*\n{esc(description)}\n\n"
                 f"Enter with `/submit {challenge_id} <your entry>`"
             ),
             parse_mode="Markdown",
@@ -517,8 +604,8 @@ async def announcewinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=challenge["chat_id"],
             text=(
-                f"🏆 Congrats to @{username} — winner of *Challenge #{challenge_id}: "
-                f"{challenge['title']}*! +{points} Stakeholder Points{reward_note} 🎉"
+                f"🏆 Congrats to @{esc(username)} — winner of *Challenge #{challenge_id}: "
+                f"{esc(challenge['title'])}*! +{points} Stakeholder Points{reward_note} 🎉"
             ),
             parse_mode="Markdown",
         )
@@ -568,9 +655,9 @@ async def award(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     db.award_points(target["telegram_id"], category, tier, points, update.effective_user.id, note)
-    note_txt = f" — _{note}_" if note else ""
+    note_txt = f" — _{esc(note)}_" if note else ""
     await update.message.reply_text(
-        f"{emoji} Awarded *{points} pts* ({tier}) to @{username} for {label}{note_txt}",
+        f"{emoji} Awarded *{points} pts* ({tier}) to @{esc(username)} for {label}{note_txt}",
         parse_mode="Markdown",
     )
 
@@ -704,7 +791,7 @@ async def generatepayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No monthly points recorded yet for registered users.")
             return
         db.clear_pending_payouts("monthly", period_label)
-        lines = [f"*Auto payout — {period_label}* ({pool} $DTF pool, top {top_n})\n"]
+        lines = [f"*Auto payout — {esc(period_label)}* ({pool} $DTF pool, top {top_n})\n"]
         for u in top:
             share = u["monthly_points"] / total_points * pool
             db.upsert_payout(u["telegram_id"], u["wallet_address"], round(share, 4), "monthly", period_label)
@@ -716,7 +803,7 @@ async def generatepayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not top:
             await update.message.reply_text("No monthly points recorded yet for registered users.")
             return
-        lines = [f"*Manual payout — {period_label}* (top {top_n}, no amounts set yet)\n"]
+        lines = [f"*Manual payout — {esc(period_label)}* (top {top_n}, no amounts set yet)\n"]
         for u in top:
             who = format_user(u["username"], u["display_name"])
             lines.append(f"{who} — {u['monthly_points']} pts")
@@ -761,12 +848,12 @@ async def payoutlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("No payout entries for that period.")
         return
-    lines = [f"*{cycle.title()} payouts — {period_label}*\n"]
+    lines = [f"*{cycle.title()} payouts — {esc(period_label)}*\n"]
     total = 0.0
     for r in rows:
         u = db.get_user(r["telegram_id"])
         who = format_user(u["username"], u["display_name"]) if u else str(r["telegram_id"])
-        wallet = r["wallet_address"] or "⚠️ no wallet"
+        wallet = esc(r["wallet_address"]) if r["wallet_address"] else "⚠️ no wallet"
         lines.append(f"{who} — {r['amount_dtf']} $DTF — `{wallet}` — {r['status']}")
         total += r["amount_dtf"]
     lines.append(f"\nTotal: {round(total, 4)} $DTF")
@@ -812,6 +899,9 @@ PUBLIC_COMMANDS = [
 ]
 
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand("submissions", "Review entries for a challenge"),
+    BotCommand("approve", "Mark a submission approved"),
+    BotCommand("reject", "Mark a submission rejected"),
     BotCommand("award", "Award tiered points"),
     BotCommand("deduct", "Deduct points"),
     BotCommand("newchallenge", "Create a scheduled challenge"),
@@ -829,6 +919,34 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("finalizepayout", "Lock in payout list"),
     BotCommand("resetmonth", "Archive and reset monthly points"),
 ]
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global fallback: without this, an unhandled exception in any
+    command just vanishes silently — no message to the user, nothing
+    visible unless you happen to be watching the logs at that exact
+    moment. This logs every failure AND pings admins in DM so it
+    actually gets noticed."""
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong handling that — an admin's been notified."
+            )
+        except Exception:
+            pass
+
+    error_summary = f"{type(context.error).__name__}: {context.error}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"⚠️ Bot error: {esc(error_summary)[:500]}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
 
 async def post_init(application: Application):
@@ -854,6 +972,7 @@ async def post_init(application: Application):
 def main():
     db.init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rules", rules))
@@ -864,6 +983,9 @@ def main():
     app.add_handler(CommandHandler("listchallenges", listchallenges))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("submit", submit))
+    app.add_handler(CommandHandler("submissions", submissions))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("reject", reject))
 
     app.add_handler(CommandHandler("award", award))
     app.add_handler(CommandHandler("deduct", deduct))
